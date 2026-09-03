@@ -43,3 +43,138 @@ Above HAL, there is NT Kernel, the low-level core of `ntoskrnl.exe`. The kernel 
 Above Ring 0, sits `ntdll.dll` in Ring 3. This is one of the most important DLLs in the entire OS from a security telemetry/interception point perspective. It is like a bridge as many Win32 API call such as `CreateFile`, `OpenProcess`, `VirtualAlloc`, etc. flows down through this. Functions in `ntdll.dll` execute system calls which transfer the control to kernel. EDR products intercept API calls in user mode in `ntdll.dll`, by patching function stubs with jump instructions.
 
 Above this, lies Win32 API DLLs such as kernel32.dll, advapi32.dll, user32.dll. These provide the documented APIs that most programs use. They are wrappers that translate Win32 calls into Native API calls, adding parameter validation and error translation.
+
+### Typical System Call Flow
+
+Everytime a user-mode program asks the OS to perform certain operations, this sequence usually executes:
+
+1. User-mode code calls a Win32 API, e.g., `ReadFile`
+2. The Win32 implementation eventually invokes a native API entry point in `ntdll.dll`, `NtReadFile`
+3. The `ntdll` system-call stub places the SSN (system-service number) into EAX register and prepares the required argument/register state
+4. The stub executes the syscall instruction
+5. The CPU transitions from Ring 3 to 0 privilege and transfers control to kernel's system call entry point configured by the OS
+6. Windows' system call entry/dispatch machinery validates and interprets the service number and selects the appropriate service table/entry
+7. The kernel-side implementation executes in Ring 0 and performs the requested operation, **in accordance with** Windows' security and kernel rules
+8. The result is returned through the system call return path, normally using `sysret` on x64, and execution resumes in user mode
+
+### Experiment 1.1
+
+Inside the VM, open notepad, and then from WinDBG in host, freeze the VM in debug mode in WinDBG and then run this command once you break in:
+
+```
+vertarget
+```
+
+This command returns the information about the OS we are debugging. The **Kernel Base** is the kernel entry point.
+
+We can also list the modules (`.sys` files) which are loaded in the kernel:
+
+```
+lm
+```
+
+We can also dump the entire active process list using the following command. **NOTE: The output would be very large since a normal Windows has thousands of processes running.**
+
+```
+!process 0 0
+```
+
+<img width="800" height="692" alt="image" src="https://github.com/user-attachments/assets/c5aa5143-10e1-40b0-a8d7-fa031a0ff7aa" />
+
+In the dump, the very first entry is the `System` (red box) and the process ID is 4 (yellow box).
+
+To dump information about a specific active process, for example, notepad, you can use this command:
+
+```
+!process 0 1f notepad.exe
+```
+
+<img width="1422" height="702" alt="image" src="https://github.com/user-attachments/assets/7d8668ae-41ea-4c06-abbf-b21fbb16cbb4" />
+
+The following image has the notepad's process details and if you scroll down a bit, there will be all its threads. The red box indicates the `EPROCESS` (a structure to represent a process in kernel mode) address, and every process has one. Below it, you can see a field called `Peb`. It is the user-mode representation of a process, hence, lies in Ring 3.
+
+<img width="1372" height="707" alt="image" src="https://github.com/user-attachments/assets/c0d40301-24c4-44b4-b8fc-bbe7e3c12916" />
+
+Similar to process, threads also have `ETHREAD` structs, the addresses of which are inside the red boxes. Similar to `Peb`, threads also have `Teb`, their user mode representation (see yellow box). 
+
+**Here is a very interesting revelation: ** Compare the addresses of `ETHREAD`, `EPROCESS`, `Teb`, and `Peb`. What difference can you see? Notice how the addresses of `ETHREAD` and `EPROCESS` are similar and same with `Teb`, and `Peb`. Well, because the user address space and the kernel address space is different! Hence, the process and threads kernel-mode structs have addresses in the same range but very different to the space of their user-mode structs. These are two worlds in one computer.
+
+### Experiment 1.2
+
+Unfreeze the VM, and open System Informer. Find the System process (PID 4). Right click and go to properties and then to the Modules tab. Most of the loaded modules will be `.sys` files, which are kernel drivers.
+
+Similarly, list the modules of `notepad.exe` and you will see a lot of `.dll` files, which are Ring 3 DLLs.
+
+This is simply to demonstrate the Ring 0/3 differences.
+
+## M2 - Boot Process
+
+When a device is totally off, nothing exists yet. When we press the power button, the OS must build itself from nothing, generally speaking.
+
+A boot chain is not just a usual sequence of operations launching each other. But it is also a chain of verification. Each stage verifies that the next stage has not been tampered with before handling over control, because, once it does, to a potentially malicious code, everything that comes after is compromised. Microsoft's entire boot security architecture is built around making this chain hard to break.
+
+The actual boot chain is very complex and it is fascinating to read about how many components actually contribute into kickstarting the OS and is best described in Windows Internals Part 2, 7th Ed. It is a good read. However, just for a reference, the boot chain can be very much simplified. This is what **Claude AI** has done in terms of simplification of boot sequence:
+
+<img width="1404" height="2210" alt="image" src="https://github.com/user-attachments/assets/e62cf57b-5b94-431d-b8c1-8973a0ed1eb4" />
+
+_Note: Generated and simplified through AI._
+
+In the Phase-3, notice "ELAM", it stands for Early-Launch Anti-Malware. Before Windows 8, a rootkit that registered itself as a boot-start driver (Start=0 in Registry) would load before any AV has a chance to run. ELAM fixed this issue by creating a special driver category called Early-Launch that loads before all third-party drivers. Windows Defender's ELAM driver (`WdBoot.sys`) examines every other boot-start driver as it loads and classifies it as _known good_, _known bad_, or _unknown_. The kernel can refuse to load a known bad driver entirely. ELAM reduced the viability of traditional boot-start rootkits, although, it did not eliminate boot kits/rootkits from using other stages and techniques.
+
+**Session 0 Isolation**: Before Windows Vista, services and user applications ran in the same desktop session called Session 1. If a service is compromised, it can directly interact with the user's desktop, which is a classic privilege escalation path known as Shatter attack. Vista introduced Session 0 isolation which mandates that all services must run in Session 0 and with no visible desktop. User sessions start at Session 1 and above. `smss.exe` creates and configures these sessions, but should not be described as a manager of user sessions. On Vista and later, SMSS creates additional instances of itself when configuring sessions, while components such as the Local Session Manager handles session management functions. Just like other processes, `smss.exe` can also be impersonated by attackers, but it can be verified by its location - `%SystemRoot%\System32\smss.exe`, digital signature, process tree, and other properties.
+
+The boot chain has been broken in practice throughout the years. A recent example can be BlackLotus (2023) which was UEFI boot kit that exploited the Secure Boot bypass vulnerability (CVE-2022-21894). This allowed an attacker to roll back the Windows Boot manager to a vulnerable version that was still legitimately signed by Microsoft and had not been revoked in the Secure Boot DBX. Because this vulnerable boot manager remained trusted, Secure Boot did not prevent it from executing. BlackLotus then exploited the boot manager vulnerability to bypass Secure Boot protections and load its malicious boot kit early in the boot process, before Windows was fully initialized.
+
+### Experiment 2.1
+
+We can verify secure boot status in VM. Open powershell as admin, and write the following command:
+
+```
+Confirm-SecureBootUEFI
+```
+
+For those VMs created with UEFI firmware, you might see True.
+
+### Experiment 2.2
+
+To read boot configuration data, open CMD as admin and write the command:
+
+```
+bcdedit
+```
+
+<img width="587" height="707" alt="image" src="https://github.com/user-attachments/assets/f07a9af9-1428-4ad6-a06e-1bcf30fef6ac" />
+
+The first arrow is the boot manager oath and notice that the `debug` field is yes since we have configured it for kernel debugging.
+
+### Experiment 2.3
+
+To see the actual boot files, you can mount the EFI system partition and see the actual boot files. In the VM, open CMD as admin and run these commands:
+
+```
+mountvol W: /s
+
+dir W:\EFI\Microsoft\Boot\
+```
+
+You will see `bootmgfw.efi`, `BCD`, and boot resources.
+
+### Experiment 2.4
+
+In the VM, open System Informer and look at the process tree. This is a good visual reference to compare against when analyzing a suspicious process relationship.
+
+<img width="782" height="587" alt="image" src="https://github.com/user-attachments/assets/638aeb25-afda-45dd-ae89-d146417111bf" />
+
+### Experiment 2.5
+
+You can verify that ELAM is loaded. In WinDBG, on the host, break into the VM, and run this command:
+
+```
+lm m WdBoot
+```
+
+You must see it here, with its load address.
+
+<img width="715" height="137" alt="image" src="https://github.com/user-attachments/assets/14bb74b7-f054-4ce4-9ced-978a853b866a" />
+
+Type `g` to resume the machine.
