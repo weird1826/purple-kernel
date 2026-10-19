@@ -188,3 +188,242 @@ kd> !devstack ffffa46c9bbecd60
 > ffffa46c9bbecd60  \FileSystem\FltMgr ffffa46c9bbeceb0  
   ffffa46c9bbe2030  \FileSystem\Ntfs   ffffa46c9bbe21b0  
 ```
+
+# IRP Structure
+
+An IRP is a single heap allocation with two parts:
+1. A fixed header - the request as a whole: status, requestor mode, buffer, pointer, flags, cancel routine, and stack bookkeeping.
+2. Variable length array of `IO_STACK_LOCATION` slots - one slot per drier in the device stack the request will traverse.
+
+The array length is decided at allocation time from the number of device objects in the chain. That count is in the header field `StackCount`. The IO Manager allocates `sizeof(IRP) + StackCount + sizeof(IO_STACK_LOCATION)`, implies the size of the IRP is not fixed. It is obvious that every driver needs its own private parameter space. If CldFlt wants to modify the read length before passing it down, it must not stomp on what NTFS expects to see. Giving each driver its own slot solves that issue. CldFlt fills slot N+1, passes the IRP down and NTFS reads N+1 fresh.
+
+IRP structure:
+
+<img width="2913" height="3418" alt="image" src="https://github.com/user-attachments/assets/28ecc6a9-6a2d-4e42-910c-9f4f6e59ff28" />
+
+
+In WinDBG, run this command:
+```
+dt nt!_IRP
+```
+Output:
+```
+kd> dt nt!_IRP
+   +0x000 Type             : Int2B
+   +0x002 Size             : Uint2B
+   +0x004 AllocationProcessorNumber : Uint2B
+   +0x006 Reserved1        : Uint2B
+   +0x008 MdlAddress       : Ptr64 _MDL
+   +0x010 Flags            : Uint4B
+   +0x014 Reserved2        : Uint4B
+   +0x018 AssociatedIrp    : <unnamed-tag>
+   +0x020 ThreadListEntry  : _LIST_ENTRY
+   +0x030 IoStatus         : _IO_STATUS_BLOCK
+   +0x040 RequestorMode    : Char
+   +0x041 PendingReturned  : UChar
+   +0x042 StackCount       : Char
+   +0x043 CurrentLocation  : Char
+   +0x044 Cancel           : UChar
+   +0x045 CancelIrql       : UChar
+   +0x046 ApcEnvironment   : Char
+   +0x047 AllocationFlags  : UChar
+   +0x048 UserIosb         : Ptr64 _IO_STATUS_BLOCK
+   +0x048 IoRingContext    : Ptr64 Void
+   +0x050 UserEvent        : Ptr64 _KEVENT
+   +0x058 Overlay          : <unnamed-tag>
+   +0x068 CancelRoutine    : Ptr64     void 
+   +0x070 UserBuffer       : Ptr64 Void
+   +0x078 Tail             : <unnamed-tag>
+```
+Note the locations for StackCount, CurrentLocation, and Tail. I am not able to expand them manually by `_IRP.Tail`, etc. because they are possibly unions and are showing as unnamed. But we can use this command to expand all:
+```
+dt nt!_IRP -b
+```
+Output:
+```
+kd> dt nt!_IRP -b
+   +0x000 Type             : Int2B
+   +0x002 Size             : Uint2B
+   +0x004 AllocationProcessorNumber : Uint2B
+   +0x006 Reserved1        : Uint2B
+   +0x008 MdlAddress       : Ptr64 
+   +0x010 Flags            : Uint4B
+   +0x014 Reserved2        : Uint4B
+   +0x018 AssociatedIrp    : <unnamed-tag>
+      +0x000 MasterIrp        : Ptr64 
+      +0x000 IrpCount         : Int4B
+      +0x000 SystemBuffer     : Ptr64 
+   +0x020 ThreadListEntry  : _LIST_ENTRY
+      +0x000 Flink            : Ptr64 
+      +0x008 Blink            : Ptr64 
+   +0x030 IoStatus         : _IO_STATUS_BLOCK
+      +0x000 Status           : Int4B
+      +0x000 Pointer          : Ptr64 
+      +0x008 Information      : Uint8B
+   +0x040 RequestorMode    : Char
+   +0x041 PendingReturned  : UChar
+   +0x042 StackCount       : Char
+   +0x043 CurrentLocation  : Char
+   +0x044 Cancel           : UChar
+   +0x045 CancelIrql       : UChar
+   +0x046 ApcEnvironment   : Char
+   +0x047 AllocationFlags  : UChar
+   +0x048 UserIosb         : Ptr64 
+   +0x048 IoRingContext    : Ptr64 
+   +0x050 UserEvent        : Ptr64 
+   +0x058 Overlay          : <unnamed-tag>
+      +0x000 AsynchronousParameters : <unnamed-tag>
+         +0x000 UserApcRoutine   : Ptr64 
+         +0x000 IssuingProcess   : Ptr64 
+         +0x008 UserApcContext   : Ptr64 
+         +0x008 IoRing           : Ptr64 
+      +0x000 AllocationSize   : _LARGE_INTEGER
+         +0x000 LowPart          : Uint4B
+         +0x004 HighPart         : Int4B
+         +0x000 u                : <unnamed-tag>
+            +0x000 LowPart          : Uint4B
+            +0x004 HighPart         : Int4B
+         +0x000 QuadPart         : Int8B
+   +0x068 CancelRoutine    : Ptr64 
+   +0x070 UserBuffer       : Ptr64 
+   +0x078 Tail             : <unnamed-tag>
+      +0x000 Overlay          : <unnamed-tag>
+         +0x000 DeviceQueueEntry : _KDEVICE_QUEUE_ENTRY
+            +0x000 DeviceListEntry  : _LIST_ENTRY
+               +0x000 Flink            : Ptr64 
+               +0x008 Blink            : Ptr64 
+            +0x010 SortKey          : Uint4B
+            +0x014 Inserted         : UChar
+         +0x000 DriverContext    : Ptr64 
+         +0x020 Thread           : Ptr64 
+         +0x028 AuxiliaryBuffer  : Ptr64 
+         +0x030 ListEntry        : _LIST_ENTRY
+            +0x000 Flink            : Ptr64 
+            +0x008 Blink            : Ptr64 
+         +0x040 CurrentStackLocation : Ptr64 
+         +0x040 PacketType       : Uint4B
+         +0x048 OriginalFileObject : Ptr64 
+         +0x050 IrpExtension     : Ptr64 
+      +0x000 Apc              : _KAPC
+         +0x000 Type             : UChar
+         +0x001 AllFlags         : UChar
+         +0x001 CallbackDataContext : Pos 0, 1 Bit
+         +0x001 Unused           : Pos 1, 7 Bits
+         +0x002 Size             : UChar
+         +0x003 SpareByte1       : UChar
+         +0x004 SpareLong0       : Uint4B
+         +0x008 Thread           : Ptr64 
+         +0x010 ApcListEntry     : _LIST_ENTRY
+            +0x000 Flink            : Ptr64 
+            +0x008 Blink            : Ptr64 
+         +0x020 KernelRoutine    : Ptr64 
+         +0x028 RundownRoutine   : Ptr64 
+         +0x030 NormalRoutine    : Ptr64 
+         +0x020 Reserved         : Ptr64 
+         +0x038 NormalContext    : Ptr64 
+         +0x040 SystemArgument1  : Ptr64 
+         +0x048 SystemArgument2  : Ptr64 
+         +0x050 ApcStateIndex    : Char
+         +0x051 ApcMode          : Char
+         +0x052 Inserted         : UChar
+      +0x000 CompletionKey    : Ptr64 
+kd> g
+```
+Note that in this build, `CurrentStackLocation = IRP + 0x78 + 0x000 + 0x040 = IRP + 0xb8`.
+Next, we will attempt to dump a live IRP. A syscall like `NtReadFile` proceeds to call `IofCallDriver(PDEVICEOBJECT, PIRP)` from where, IRP is construced. So we put a breakpoint at `IofCallDriver` and dump its rdx (since it is the second argument).
+```
+kd> !irp rdx
+Irp is active with 9 stacks 10 is current (= 0xffffa46ca17f2a08)
+ No Mdl: No System Buffer: Thread ffffa46c9dbdc080:  Irp is completed.  
+     cmd  flg cl Device   File     Completion-Context
+ [N/A(0), N/A(0)]
+            0  0 00000000 00000000 00000000-00000000    
+
+			Args: 00000000 00000000 00000000 00000000
+ [N/A(0), N/A(0)]
+            0  0 00000000 00000000 00000000-00000000    
+
+			Args: 00000000 00000000 00000000 00000000
+ [N/A(0), N/A(0)]
+            0  0 00000000 00000000 00000000-00000000    
+
+			Args: 00000000 00000000 00000000 00000000
+ [N/A(0), N/A(0)]
+            0  0 00000000 00000000 00000000-00000000    
+
+			Args: 00000000 00000000 00000000 00000000
+ [N/A(0), N/A(0)]
+            0  0 00000000 00000000 00000000-00000000    
+
+			Args: 00000000 00000000 00000000 00000000
+ [N/A(0), N/A(0)]
+            0  0 00000000 00000000 00000000-00000000    
+
+			Args: 00000000 00000000 00000000 00000000
+ [N/A(0), N/A(0)]
+            0  0 00000000 00000000 00000000-00000000    
+
+			Args: 00000000 00000000 00000000 00000000
+ [N/A(0), N/A(0)]
+            0  0 00000000 00000000 00000000-00000000    
+
+			Args: 00000000 00000000 00000000 00000000
+ [IRP_MJ_CREATE(0), N/A(0)]
+            0  0 ffffa46c9bbb28f0 ffffa46ca67baee0 00000000-00000000    
+	       \Driver\iorate
+			Args: ffffc9de0b9803f8 01000060 00030000 00000000
+```
+
+There is a chance that you can get an output like this. The stack numbers and current numbers might differ. In my capture, it is 9 stacks and 10 is current. Implies, this is the sentinel state. The address in brackets `(= 0xffffa46ca17f2a08)` is `Tail.Overlay.CurrentStackLocation`, pointing one slot past the end of the array. We are at `IoFCallDriver` entry, before `IoSetNextIrpStackLocation` is called internally.
+
+Notice slots 0 to 7 are all zeroes. Slot 8 is `StackCount - 1` which is the topmost slot. That is the first driver that will receive this CREATE request and it was filled by IO Manager just before it called `IofCallDriver`. The rest of the lines above are waiting to be populated as the request travels down.
+
+But if necessary, I will get back to it. If the numbers are low, and if you are seeing things like `[N/A(e), N/A(0)]` all along, then it is better to repeat this to get an IRP with a higher number. We will try to dump the IRP at rdx at this point:
+
+```
+kd> dt nt!_IRP ffffa46ca17f26b0
+   +0x000 Type             : 0n6
+   +0x002 Size             : 0x478
+   +0x004 AllocationProcessorNumber : 0
+   +0x006 Reserved1        : 0xf805
+   +0x008 MdlAddress       : (null) 
+   +0x010 Flags            : 0x884
+   +0x014 Reserved2        : 0xc88edf39
+   +0x018 AssociatedIrp    : <unnamed-tag>
+   +0x020 ThreadListEntry  : _LIST_ENTRY [ 0xffffa46c`9dbdc5c0 - 0xffffa46c`9dbdc5c0 ]
+   +0x030 IoStatus         : _IO_STATUS_BLOCK
+   +0x040 RequestorMode    : 1 ''
+   +0x041 PendingReturned  : 0 ''
+   +0x042 StackCount       : 9 ''
+   +0x043 CurrentLocation  : 10 ''
+   +0x044 Cancel           : 0 ''
+   +0x045 CancelIrql       : 0 ''
+   +0x046 ApcEnvironment   : 0 ''
+   +0x047 AllocationFlags  : 0x4 ''
+   +0x048 UserIosb         : 0xffffc9de`0b9803c8 _IO_STATUS_BLOCK
+   +0x048 IoRingContext    : 0xffffc9de`0b9803c8 Void
+   +0x050 UserEvent        : (null) 
+   +0x058 Overlay          : <unnamed-tag>
+   +0x068 CancelRoutine    : (null) 
+   +0x070 UserBuffer       : (null) 
+   +0x078 Tail             : <unnamed-tag
+```
+
+See that the size is 0x478. Size of `IO_STACK_LOCATION` struct (each slot) is 0x48 in this build, which one can confirm using this command:
+
+```
+kd> dt nt!_IO_STACK_LOCATION
+   +0x000 MajorFunction    : UChar
+   +0x001 MinorFunction    : UChar
+   +0x002 Flags            : UChar
+   +0x003 Control          : UChar
+   +0x008 Parameters       : <unnamed-tag>
+   +0x028 DeviceObject     : Ptr64 _DEVICE_OBJECT
+   +0x030 FileObject       : Ptr64 _FILE_OBJECT
+   +0x038 CompletionRoutine : Ptr64     long 
+   +0x040 Context          : Ptr64 Void
+```
+
+Continuing on that, there are 9 slots. So, 9 * 0x48 = 0x288 for all slots. The `CurrentStackLocation` is `0xffffa46ca17f2a08` and IRP Base is `0xffffa46ca17f26b0` (the rdx value). The difference between these two is 0x358 and that is where the sentinel lives. Slot 0 starts at `base + 0x358 - 9*0x48`, where 9 comes from the number of slots, and 0x48 is the size of each slot. This boils down to `base + 0xd0`. So, `size of IRP + StackCount * 0x48 = 0xd0 + 0x288 = 0x358`, while Size is `0x478`. The extra `0x120` is IO manager's reserved space and not the part of the struct or the slot array.
+
+Hence, takeaways from this is that IofCallDriver fires on every IO in the system. 
