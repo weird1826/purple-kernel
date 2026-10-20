@@ -430,59 +430,19 @@ Hence, takeaways from this is that IofCallDriver fires on every IO in the system
 
 # `IO_STACK_LOCATION` Slot
 
-We will understand the slot for each driver that it receives. Now you see, each `IO_STACK_LOCATION` in an IRP is one driver's private parameter block. It is written by the **driver above** (or by the IO Manager for the top slot), read by the driver it is addressed to, and then either passed down (with the next slot filled) or completed.
+The IRP travels down a chain of drivers. As we know that IRP has many slots of `IO_STACK_LOCATION`, each representing a driver's own private view of the same request. The slot is the only thing that changes as the IRP moves. The request, buffers, and the file object identity are shared while the slot is per-driver.
 
-The slot has six things that matter:
-1. `MajorFunction`: IRP major code which tells driver what _kind_ of request this is.
-2. `MinorFunction`: a sub-code for operations that have one. `CREATE` uses `IRP_MN_*`; most others have `IRP_MN_NORMAL=0`.
-3. `Flags`/`Control`: `SL_INVOKE_ON_SUCCESS/ERROR/CANCEL` (when the completion routine should run), and `SL_PENDING_RETURNED` (whether the op has been pended).
-4. `Parameters`: It is a union data type and its layout depends on `MajorFunction`. The arguments are placed here.
-5. `DeviceObject`: The device object this slot is targeting. Usually the device this current driver is attached to.
-6. `FileObject`: The `FILE_OBJECT` struct for file-related requests. The same field is valid for CREATE, READ, WRITE, CLEANUP, CLOSE, and the information/control ops. If we are looking for "which file", this is where we can find it, regardless of major code.
-7. `CompletionRoutine` / `Context`: This is the driver's completion call back and its argument, if it registered one with `IoSetCompletionRoutine`.
+The slot carries seven things:
+1. `MajorFunction` - The IRP major code which tells the driver what kind of request this it.
+2. `MinorFunction` - a sub-code for operations that have one. `CREATE` uses `IRP_MN_*` and most others use `IRP_MN_NORMAL=0`.
+3. `Flags`/`Control` - `SL_INVOKE_ON_SUCCESS/ERROR/CANCEL` (when completion routine runs) and `SL_PENDING_RETURNED` (whether the op has been pended).
+4. `Parameters` - it is a union data type and its layout depends entirely on `MajorFunction`. This is the place where operation arguments reside.
+5. `DeviceObject` specifies the device object that the particular slot targets.
+6. `FileObject` is the `FILE_OBJECT` type for file-related requests. It is not inside the union. Valid for CREATE, READ, WRITE, CLEANUP, CLOSE, and information/control ops. If we are looking for "which file", then this is the one which gives us answers for that.
+7. `CompletionRoutine`/`Context` is the driver's completion call back and its argument, if one was registered via `IoSetCompletionRoutine`.
 
-All union members occupy the same bytes. Reading `.Read.Length` off a `CREATE` IRP reads bytes that happen to belong to `.Create.ShareAccess` or padding; the value is meaningless. But this is a bug class which appears in such drivers: a handler that reads the wrong union member for the operation it is processing, or one that trusts a class/control value from user mode and then reinterprets the same buffer as a different structure.
+The union is the only tricky part as all members occupy the same 0x20 bytes. Reading the wrong member for the current `MajorFunction` returns garbage bytes. That is a bug class. If a handler reads a union member that does not match its registered operation, that is a red flag. Tw things that matter but are not in the slot:
+1. The data buffer is on the IRP not the slot. The slot carries Length, Input Buffer Length, and Output Buffer Length which are the sizes. The actual pointer lives inside IRP in User Buffer, MdlAddress, or AssociatedIrp.SystemBuffer, depending on the device object's I/O method. Split deliberately as the size is per-driver and the buffer is per-request.
+2. The file name for CREATE is on FILE_OBJECT->FileName, not in Parameters.Create. The create parameters carry flags like Options, FileAttributes, ShareAccess, EaLength, SecurityContext and not the path.
 
-For `cldflt` specifically, the union members that matters are the following:
-
-| MajorFunction | Union member | Fields that matter |
-|---|---|---|
-| `IRP_MJ_CREATE` | `Parameters.Create` | `SecurityContext`, `Options` (disposition flags like `FILE_OPEN`, `FILE_CREATE`), `FileAttributes`, `ShareAccess`, `EaLength`. The file name is on `FILE_OBJECT->FileName`, not here. `FILE_OBJECT->RelatedFileObject` matters for relative opens. |
-| `IRP_MJ_READ` | `Parameters.Read` | `Length`, `Key`, `ByteOffset` (`LARGE_INTEGER`) |
-| `IRP_MJ_WRITE` | `Parameters.Write` | `Length`, `Key`, `ByteOffset`, `WriteCompletionContext` |
-| `IRP_MJ_CLEANUP` | *(none)* | Last handle is closing; no parameters. The file object is the payload. |
-| `IRP_MJ_CLOSE` | *(none)* | Object is going away. Same. |
-| `IRP_MJ_QUERY_INFORMATION` | `Parameters.QueryFileInformation` | `Length`, `FileInformationClass`, `FileInformation` |
-| `IRP_MJ_SET_INFORMATION` | `Parameters.SetFileInformation` | `Length`, `FileInformationClass`, `FileInformation` |
-| `IRP_MJ_FILE_SYSTEM_CONTROL` | `Parameters.FileSystemControl` | `OutputBufferLength`, `InputBufferLength`, `FsControlCode`, `Type3InputBuffer` |
-| `IRP_MJ_DEVICE_CONTROL` | `Parameters.DeviceIoControl` | `OutputBufferLength`, `InputBufferLength`, `IoControlCode`, `Type3InputBuffer` |
-
-You might be asking that we discussing all about these file operations but are not seeing the actual pointer to the data anywhere. For instance, look at the row for `IRP_MJ_READ`:
-
-```
-Parameters.Read.Length    : ULONG
-Parameters.Read.Key       : ULONG
-Parameters.Read.ByteOffset: LARGE_INTEGER
-```
-One might think that the Length is the size of the data, but where is the pointer to the data itself? Shouldn't there be a buffer field here? Well, no. The slot specifies how much data to move. IRP has the information of data's location.
-
-<img width="2207" height="738" alt="image" src="https://github.com/user-attachments/assets/3580fe72-e15c-49fe-a632-c7dd10b20609" />
-
-The slot specifies the quantity and IRP says location. Hence, the slot is per-driver and the buffer is per-request.
-
-The reason such a setup is there is because imagine a read request going through Cldflt to NTFS to disk. If each driver had its own buffer pointer in its own slot, the developer would have three pointers to the same bugger, and the rules for who owns the pointer, who can change it, and what happens if one driver redirects the buffer would be a nightmare. Hence, one buffer on the IRP is a good choice,. 
-
-There are two these two methods: `IRP_MJ_QUERY_INFORMATION` and `IRP_MJ_SET_INFORMATION`. Both of these have a field called `FileInformationClass`. For these two operations, the buffer's layout is not fixed. The same buffer bytes mean different things depending on what `FileInformationClass` says they are. It is a type tag and it conveys which struct to cast the buffer to. On Windows there are dozens of these classes. Here are three examples:
-
-<img width="1599" height="2005" alt="image" src="https://github.com/user-attachments/assets/308d515f-5714-47b0-b9b4-ef618159a757" />
-
-Because both the class number and buffer bytes are supplied by the caller, a driver has to do three things correctly:
-1. Validate that the class is one it knows how to handle. If driver cannot handle a class number 47, the driver must reject it and not to fall-through and read the buffer with the wrong struct.
-2. Validate that length is big enough for the struct that class implies. Class 10, which is `FileRenameInformation` has a variable length name at the end. If the length is 0x10 but the caller claims class 10, a driver that reads `FileNameLength` from the buffer and then `FileName` beyond the buffer boundary is reading out of bounds. This is exactly the pattern in many file system vulnerabilities.
-3. Not re-read the class later and assume it is the same: If the driver validates class 4, then passes the IRP down, and something below changes the class field to 10, then a later driver reading the buffer as class 10 gets type confusion.
-
-Here is the complete structure of `IO_STACK_LOCATION`:
-
-<img width="2173" height="2758" alt="image" src="https://github.com/user-attachments/assets/ebbcbb2e-4a42-45e6-a9f0-1234cf990762" />
-
-The union is one 0x20 byte region. Every named member aliases the same memory. That is the whole game.
+The type discriminator pattern appears wherever a variable-length buffer is involved. A field such as as FileInformationClass for query/set info, IoControlCode/FsControlCode for control ops, the reparse tag for reparse data, the message type for CldFlt's port decides how to interpret the buffer bytes. Same pointer can mean different struct per value. Mis-validating the discriminator or failing to check that length is large enough for the struct the discriminator implies, is a standard type-confusion/OOB bug class.
